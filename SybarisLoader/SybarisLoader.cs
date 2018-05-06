@@ -2,29 +2,30 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Configuration;
 using Mono.Cecil;
-using SybarisLoader.Util;
+using System.Diagnostics;
 
 namespace SybarisLoader
 {
-    /// <summary>
-    ///     The entry point class of patch loader.
-    /// </summary>
-    /// <remarks>
-    ///     At the moment this loader requires to System.dll being loaded into memroy to work, which is why it cannot be
-    ///     patched with this method.
-    /// </remarks>
     public static class Loader
     {
         private static Dictionary<string, List<MethodInfo>> patchersDictionary;
 
-        public static void LoadPatchers()
+        /// <summary>
+        ///     Load sybaris compatible patchers from supplied folder
+        /// </summary>
+        /// <remarks>
+        ///     At the moment this loader requires to System.dll (and others) being loaded into memroy to work,
+        ///     which is why it cannot be patched with this method.
+        /// </remarks>
+        public static void LoadPatchers(string dir)
         {
             patchersDictionary = new Dictionary<string, List<MethodInfo>>();
 
-            Logger.Log(LogLevel.Info, "Loading patchers");
-
-            foreach (string dll in Directory.GetFiles(Utils.SybarisDir, "*.Patcher.dll"))
+            Trace.TraceInformation("Loading patchers");
+            
+            foreach (string dll in Directory.GetFiles(dir,"*.Patcher.dll"))
             {
                 Assembly assembly;
 
@@ -34,9 +35,9 @@ namespace SybarisLoader
                 }
                 catch (Exception e)
                 {
-                    Logger.Log(LogLevel.Error, $"Failed to load {dll}: {e.Message}");
+                    Trace.TraceError($"Failed to load {dll}: {e.Message}");
                     if (e.InnerException != null)
-                        Logger.Log(LogLevel.Error, $"Inner: {e.InnerException}");
+                        Trace.TraceError($"Inner: {e.InnerException}");
                     continue;
                 }
 
@@ -65,7 +66,7 @@ namespace SybarisLoader
                     if (requestedAssemblies == null || requestedAssemblies.Length == 0)
                         continue;
 
-                    Logger.Log(LogLevel.Info, $"Adding {type.FullName}");
+                    Trace.TraceInformation($"Adding {type.FullName}");
 
                     foreach (string requestedAssembly in requestedAssemblies)
                     {
@@ -84,20 +85,29 @@ namespace SybarisLoader
         /// <summary>
         ///     Carry out patching on the asemblies.
         /// </summary>
-        public static void Patch()
+        /// <remarks>
+        ///     The returned list of assemblies is to be from memory by the caller
+        ///     (possibly after further transforms).
+        ///     Since .NET loads all assemblies only once,
+        ///     any further attempts by Unity to load the patched assemblies
+        ///     will do nothing. Thus we achieve the same "dynamic patching" effect as with Sybaris.
+        /// </remarks>
+
+        public static List<AssemblyDefinition> Patch(string dir)
         {
-            Logger.Log(LogLevel.Info, "Patching assemblies:");
+            var output = new List<AssemblyDefinition>();
+            Trace.TraceInformation("Patching assemblies:");
 
             foreach (KeyValuePair<string, List<MethodInfo>> patchJob in patchersDictionary)
             {
                 string assemblyName = patchJob.Key;
                 List<MethodInfo> patchers = patchJob.Value;
 
-                string assemblyPath = Path.Combine(Utils.GameAssembliesDir, assemblyName);
+                string assemblyPath = Path.Combine(dir, assemblyName);
 
                 if (!File.Exists(assemblyPath))
                 {
-                    Logger.Log(LogLevel.Warning, $"{assemblyPath} does not exist. Skipping...");
+                    Trace.TraceWarning($"{assemblyPath} does not exist. Skipping...");
                     continue;
                 }
 
@@ -109,13 +119,13 @@ namespace SybarisLoader
                 }
                 catch (Exception e)
                 {
-                    Logger.Log(LogLevel.Error, $"Failed to open {assemblyPath}: {e.Message}");
+                    Trace.TraceError($"Failed to open {assemblyPath}: {e.Message}");
                     continue;
                 }
 
                 foreach (MethodInfo patcher in patchers)
                 {
-                    Logger.Log(LogLevel.Info, $"Running {patcher.DeclaringType.FullName}");
+                    Trace.TraceInformation($"Running {patcher.DeclaringType.FullName}");
                     try
                     {
                         patcher.Invoke(null, new object[] {assemblyDefinition});
@@ -125,119 +135,35 @@ namespace SybarisLoader
                         Exception inner = te.InnerException;
                         if (inner != null)
                         {
-                            Logger.Log(LogLevel.Error, $"Error inside the patcher: {inner.Message}");
-                            Logger.Log(LogLevel.Error, $"Stack trace:\n{inner.StackTrace}");
+                            Trace.TraceError($"Error inside the patcher: {inner.Message}");
+                            Trace.TraceError($"Stack trace:\n{inner.StackTrace}");
                         }
                     }
                     catch (Exception e)
                     {
-                        Logger.Log(LogLevel.Error, $"By the patcher loader: {e.Message}");
-                        Logger.Log(LogLevel.Error, $"Stack trace:\n{e.StackTrace}");
+                        Trace.TraceError($"By the patcher loader: {e.Message}");
+                        Trace.TraceError($"Stack trace:\n{e.StackTrace}");
                     }
                 }
 
-                MemoryStream ms = new MemoryStream();
-
-                // Write the patched assembly into memory
-                assemblyDefinition.Write(ms);
-                assemblyDefinition.Dispose();
-
-                byte[] assemblyBytes = ms.ToArray();
-
                 // Save the patched assembly to a file for debugging purposes
-                SavePatchedAssembly(assemblyBytes, Path.GetFileNameWithoutExtension(assemblyName));
+                if (Properties.Settings.Default.debug)
+                    SavePatchedAssembly(dir, assemblyDefinition, Path.GetFileNameWithoutExtension(assemblyName));
 
-                // Load the patched assembly directly from memory
-                // Since .NET loads all assemblies only once,
-                // any further attempts by Unity to load the patched assemblies
-                // will do nothing. Thus we achieve the same "dynamic patching" effect as with Sybaris.
-                Assembly.Load(ms.ToArray());
-
-                ms.Dispose();
+                output.Add(assemblyDefinition);
             }
+            return output;
         }
 
-        /// <summary>
-        ///     The entry point of the loader
-        /// </summary>
-        public static void Main()
+        public static void SavePatchedAssembly(string dir, AssemblyDefinition ass, string name)
         {
-            if (!Directory.Exists(Utils.SybarisDir))
-                Directory.CreateDirectory(Utils.SybarisDir);
+            MemoryStream ms = new MemoryStream();
+            ass.Write(ms);
+            byte[] assemblyBytes = ms.ToArray();
 
-            Configuration.Init();
-
-            if (!Configuration.Options["debug"]["logging"]["outputDirectory"].IsString)
-                Configuration.Options["debug"]["logging"]["enabled"] = false;
-            else if (!Directory.Exists(Configuration.Options["debug"]["logging"]["outputDirectory"]))
-                Directory.CreateDirectory(Configuration.Options["debug"]["logging"]["outputDirectory"]);
-
-            if (!Directory.Exists(Configuration.Options["debug"]["outputAssemblies"]["outputDirectory"]))
-                Directory.CreateDirectory(Configuration.Options["debug"]["outputAssemblies"]["outputDirectory"]);
-
-            if (Configuration.Options["debug"]["logging"]["enabled"])
-                Logger.Enabled = true;
-            if (Configuration.Options["debug"]["logging"]["redirectConsole"])
-                Logger.RerouteStandardIO();
-
-            Logger.Log("===Sybaris Loader===");
-            Logger.Log($"Started on {DateTime.Now:R}");
-            Logger.Log($"Game assembly directory: {Utils.GameAssembliesDir}");
-            Logger.Log($"Sybaris directory: {Utils.SybarisDir}");
-
-            // We add a custom assembly resolver
-            // Since assemblies don't unload, this event handler will be called always there is an assembly to resolve
-            // This allows us to put our patchers and plug-ins in our own folders.
-            AppDomain.CurrentDomain.AssemblyResolve += ResolvePatchers;
-
-            LoadPatchers();
-
-            if (patchersDictionary.Count == 0)
-            {
-                Logger.Log(LogLevel.Info, "No valid patchers found! Quiting...");
-                Logger.Dispose();
-                return;
-            }
-
-            Patch();
-
-            Logger.Log(LogLevel.Info, "Patching complete! Disposing of logger!");
-            Logger.Dispose();
-        }
-
-        public static Assembly ResolvePatchers(object sender, ResolveEventArgs args)
-        {
-            // Try to resolve from patches directory
-            if (Utils.TryResolveDllAssembly(args.Name, Utils.SybarisDir, out Assembly patchAssembly))
-                return patchAssembly;
-            return null;
-        }
-
-        private static void SavePatchedAssembly(byte[] assembly, string name)
-        {
-            if (!Configuration.Options["debug"]["outputAssemblies"]["enabled"]
-                || !Configuration.Options["debug"]["outputAssemblies"]["outputDirectory"].IsString
-                || Configuration.Options["debug"]["outputAssemblies"]["outputDirectory"] == null)
-                return;
-
-            string outDir = Configuration.Options["debug"]["outputAssemblies"]["outputDirectory"];
-
-            string path = Path.Combine(outDir, $"{name}_patched.dll");
-
-            if (!Directory.Exists(outDir))
-                try
-                {
-                    Directory.CreateDirectory(outDir);
-                }
-                catch (Exception e)
-                {
-                    Logger.Log(LogLevel.Warning, $"Failed to create patched assembly directory to {outDir}!\nReason: {e.Message}");
-                    return;
-                }
-
-            File.WriteAllBytes(path, assembly);
-
-            Logger.Log(LogLevel.Info, $"Saved patched {name} to {path}");
+            string path = Path.Combine(dir, $"{name}_patched.dll");
+            File.WriteAllBytes(path, assemblyBytes);
+            Debug.WriteLine($"Saved patched {name} to {path}");
         }
     }
 }
